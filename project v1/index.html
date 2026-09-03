@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quick Paste & Agent</title>
+    <style>
+        :root {
+            --primary-color: #2563eb;
+            --primary-hover: #1d4ed8;
+            --agent-color: #8b5cf6;
+            --agent-hover: #7c3aed;
+            --bg-color: #f3f4f6;
+            --container-bg: #ffffff;
+            --text-color: #1f2937;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 800px;
+            background-color: var(--container-bg);
+            padding: 24px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            margin-bottom: 24px;
+        }
+
+        h2 {
+            margin-top: 0;
+            font-size: 1.5rem;
+            border-bottom: 2px solid #e5e7eb;
+            padding-bottom: 10px;
+        }
+
+        textarea {
+            width: 100%;
+            min-height: 200px;
+            padding: 12px;
+            font-family: monospace;
+            font-size: 14px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            box-sizing: border-box;
+            resize: vertical;
+            margin-bottom: 16px;
+            line-height: 1.5;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.2);
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        button {
+            border: none;
+            padding: 10px 20px;
+            font-size: 15px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 500;
+        }
+
+        .btn-save { background-color: var(--primary-color); }
+        .btn-save:hover { background-color: var(--primary-hover); }
+
+        .btn-agent { background-color: var(--agent-color); }
+        .btn-agent:hover { background-color: var(--agent-hover); }
+
+        button:disabled {
+            background-color: #9ca3af !important;
+            cursor: not-allowed;
+        }
+
+        .status {
+            font-size: 14px;
+            margin-left: 8px;
+        }
+        .status.success { color: #16a34a; }
+        .status.error { color: #dc2626; }
+
+        .note-card {
+            background-color: #f9fafb;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+
+        .note-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            border-bottom: 1px dashed #e5e7eb;
+            padding-bottom: 8px;
+        }
+
+        .note-meta {
+            font-size: 12px;
+            color: #6b7280;
+            margin: 0;
+        }
+
+        .delete-btn {
+            background: none;
+            border: none;
+            color: #ef4444;
+            padding: 4px 8px;
+            font-size: 13px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        .delete-btn:hover { background-color: #fee2e2; }
+
+        .note-content {
+            margin: 0;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-family: monospace;
+            font-size: 14px;
+            line-height: 1.6;
+            color: #374151;
+        }
+
+        .agent-reply-box {
+            margin-top: 12px;
+            padding: 12px;
+            background-color: #f5f3ff;
+            border-left: 4px solid var(--agent-color);
+            border-radius: 0 4px 4px 0;
+            font-size: 14px;
+            color: #4c1d95;
+            line-height: 1.5;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h2>Quick Paste Center</h2>
+        <textarea id="noteInput" placeholder="Paste any text, logs, or content here..."></textarea>
+        <div class="btn-group">
+            <button id="saveBtn" class="btn-save" onclick="submitNote('save')">Save Text Only</button>
+            <button id="agentBtn" class="btn-agent" onclick="submitNote('agent')">Send to Agent</button>
+            <span id="statusMessage" class="status"></span>
+        </div>
+    </div>
+
+    <div class="container">
+        <h2>History</h2>
+        <div id="notesList">
+            <p style="color: #6b7280; font-size: 14px;">Loading...</p>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE_URL = 'http://127.0.0.1:8000/api';
+
+        function escapeHTML(str) {
+            if (!str) return '';
+            return str.replace(/[&<>'"]/g, 
+                tag => ({
+                    '&': '&amp;',
+                    '<': '&lt;',
+                    '>': '&gt;',
+                    "'": '&#39;',
+                    '"': '&quot;'
+                }[tag])
+            );
+        }
+
+        async function submitNote(action) {
+            const textarea = document.getElementById('noteInput');
+            const saveBtn = document.getElementById('saveBtn');
+            const agentBtn = document.getElementById('agentBtn');
+            const statusBox = document.getElementById('statusMessage');
+            
+            const content = textarea.value;
+
+            if (!content.trim()) {
+                showStatus('Please enter or paste text', 'error');
+                return;
+            }
+
+            saveBtn.disabled = true;
+            agentBtn.disabled = true;
+            
+            if (action === 'save') {
+                saveBtn.innerText = 'Saving...';
+            } else {
+                agentBtn.innerText = 'Processing...';
+            }
+            statusBox.innerText = '';
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/notes`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: content, action: action })
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    showStatus(data.message + ' (ID: ' + data.id + ')', 'success');
+                    textarea.value = ''; 
+                    loadNotes();         
+                } else {
+                    const errorMsg = data.detail ? JSON.stringify(data.detail) : 'Operation failed';
+                    showStatus('Error: ' + errorMsg, 'error');
+                }
+            } catch (error) {
+                showStatus('Network error, please check if the backend service is running', 'error');
+            } finally {
+                saveBtn.disabled = false;
+                agentBtn.disabled = false;
+                saveBtn.innerText = 'Save Text Only';
+                agentBtn.innerText = 'Send to Agent';
+            }
+        }
+
+        async function loadNotes() {
+            const listContainer = document.getElementById('notesList');
+            try {
+                const response = await fetch(`${API_BASE_URL}/notes`);
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    if (data.data.length === 0) {
+                        listContainer.innerHTML = '<p style="color: #6b7280; font-size: 14px;">No records found</p>';
+                        return;
+                    }
+
+                    listContainer.innerHTML = data.data.map(note => {
+                        const agentHtml = note.agent_reply 
+                            ? `<div class="agent-reply-box"><strong>Agent Reply:</strong><br>${escapeHTML(note.agent_reply)}</div>` 
+                            : '';
+
+                        return `
+                            <div class="note-card">
+                                <div class="note-header">
+                                    <div class="note-meta">#${note.id} · ${note.created_at} ${note.agent_reply ? '· Analyzed' : ''}</div>
+                                    <button class="delete-btn" onclick="deleteNote(${note.id})">Delete</button>
+                                </div>
+                                <pre class="note-content">${escapeHTML(note.content)}</pre>
+                                ${agentHtml}
+                            </div>
+                        `;
+                    }).join('');
+                }
+            } catch (error) {
+                listContainer.innerHTML = '<p style="color: #dc2626; font-size: 14px;">Failed to load records. Please check the backend service.</p>';
+            }
+        }
+
+        async function deleteNote(id) {
+            if (!confirm(`Are you sure you want to delete record #${id}?`)) return;
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/notes/${id}`, { method: 'DELETE' });
+                const data = await response.json();
+                if (response.ok && data.success) {
+                    showStatus(`Record #${id} deleted`, 'success');
+                    loadNotes(); 
+                } else {
+                    showStatus('Error: ' + (data.detail || 'Delete failed'), 'error');
+                }
+            } catch (error) {
+                showStatus('Network error, cannot connect to server', 'error');
+            }
+        }
+
+        function showStatus(message, type) {
+            const statusBox = document.getElementById('statusMessage');
+            statusBox.className = 'status ' + type;
+            statusBox.innerText = message;
+            if(type === 'success') {
+                setTimeout(() => { if (statusBox.innerText === message) statusBox.innerText = ''; }, 3000);
+            }
+        }
+
+        window.onload = loadNotes;
+    </script>
+</body>
+</html>
