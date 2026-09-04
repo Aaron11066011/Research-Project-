@@ -1,9 +1,19 @@
-import sqlite3
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
-from openai import OpenAI
+from openai import AsyncOpenAI
+from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
+
+
+# ================= Configuration & Environment =================
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+# 如果部署到云端，请使用真实的 OpenAI API 或其他云端模型
+AI_BASE_URL = os.getenv("AI_BASE_URL", "http://localhost:1234/v1")
+AI_API_KEY = os.getenv("AI_API_KEY", "local-model")
+AI_MODEL = os.getenv("AI_MODEL", "Qwen 3.5 9B")
 
 # ================= Data Model =================
 class NoteCreate(BaseModel):
@@ -18,28 +28,17 @@ class NoteCreate(BaseModel):
             raise ValueError("Content cannot be empty")
         return cleaned
 
+# MongoDB 文档响应模型
+class NoteResponse(BaseModel):
+    id: str
+    content: str
+    agent_reply: str | None = None
+    created_at: str
+
 # ================= Database Setup =================
-DB_FILE = "notes.db"
-
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            content TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    try:
-        cursor.execute('ALTER TABLE notes ADD COLUMN agent_reply TEXT')
-    except sqlite3.OperationalError:
-        pass 
-    
-    conn.commit()
-    conn.close()
-
-init_db()
+client = AsyncIOMotorClient(MONGO_URL)
+db = client.notes_database
+notes_collection = db.get_collection("notes")
 
 # ================= FastAPI App =================
 app = FastAPI(title="Quick Paste & Agent API")
@@ -55,109 +54,81 @@ app.add_middleware(
 # ================= API Endpoints =================
 
 @app.get("/")
-def read_root():
+async  def read_root():
     return {"message": "API service is running. Open index.html in your browser to use the tool."}
 
 @app.post("/api/notes")
-def create_note(note: NoteCreate):
+async def create_note(note: NoteCreate):
     try:
         agent_reply = None
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
         # =========================================================
         # [API Integration]
         # =========================================================
         if note.action == "agent":
             try:
-                # Initialize AI client for LOCAL MODEL
-                client = OpenAI(
-                    # Base URL for Ollama local server
-                    # Note: If you use LM Studio, change this to "http://localhost:1234/v1"
-                    base_url="http://localhost:1234/v1", 
-                    
-                    # API key is required by the SDK format, but local servers usually ignore it
-                    api_key="local-model", 
-                )
-                
-                # Send request to local AI
-                response = client.chat.completions.create(
-                    # Must match the exact model name you downloaded (e.g., "llama3", "qwen2")
-                    model="Qwen 3.5 9B", 
+                ai_client = AsyncOpenAI(base_url=AI_BASE_URL, api_key=AI_API_KEY)
+                response = await ai_client.chat.completions.create(
+                    model=AI_MODEL, 
                     messages=[
-                        {"role": "system", "content": "You are a data commentary and analysis expert. Split each comment into separate “aspect” sentences; each sentence can be mapped to one or more Factors (multi-label; a single comment can contribute to multiple Factors at the same time).If a passage contains a positive message, add one point; if it contains a negative message, subtract one point; for ambiguous or irrelevant passages, give zero points. just give final marks."},
+                        {"role": "system", "content": "You are a data commentary and analysis expert. Split each comment into separate “aspect” sentences; each sentence can be mapped to one or more Factors (multi-label; a single comment can contribute to multiple Factors at the same time).If a passage contains a positive message, add one point; if it contains a negative message, subtract one point; for ambiguous or irrelevant passages, give zero points. just give final marks"},
                         {"role": "user", "content": note.content}
                     ],
                     max_tokens=10000000,
                     temperature=0.1
-
-                )
-                
+                )         
                 agent_reply = response.choices[0].message.content
                 
             except Exception as e:
                 agent_reply = f"Failed to connect to local AI API: {str(e)}"
+
         # =========================================================
         
         # =========================================================
 
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        cursor.execute(
-            "INSERT INTO notes (content, agent_reply, created_at) VALUES (?, ?, ?)", 
-            (note.content, agent_reply, now)
-        )
-        conn.commit()
-        new_id = cursor.lastrowid
-        conn.close()
+       # 插入 MongoDB
+        note_dict = {
+            "content": note.content,
+            "agent_reply": agent_reply,
+            "created_at": now
+        }
+        result = await notes_collection.insert_one(note_dict)
         
         return {
             "success": True, 
-            "id": new_id, 
+            "id": str(result.inserted_id), 
             "agent_reply": agent_reply,
             "message": "Agent channel triggered" if note.action == "agent" else "Text saved successfully"
-        }
-    
+        }     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Write failed: {str(e)}")
 
-@app.get("/api/notes")
-def get_notes():
+@app.get("/api/notes", response_model=dict)
+async def get_notes():
     try:
-        conn = sqlite3.connect(DB_FILE)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT id, content, agent_reply, created_at FROM notes ORDER BY id DESC LIMIT 20")
-        rows = cursor.fetchall()
-        conn.close()
-        
-        notes = [{
-            "id": row["id"], 
-            "content": row["content"], 
-            "agent_reply": row["agent_reply"],
-            "created_at": row["created_at"]
-        } for row in rows]
-        
+        # 获取最新 20 条记录
+        cursor = notes_collection.find().sort("_id", -1).limit(20)
+        notes = []
+        async for document in cursor:
+            notes.append({
+                "id": str(document["_id"]),
+                "content": document["content"],
+                "agent_reply": document.get("agent_reply"),
+                "created_at": document.get("created_at")
+            })
         return {"success": True, "data": notes}
-        
+    
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database read failed: {str(e)}")
 
 @app.delete("/api/notes/{note_id}")
-def delete_note(note_id: int):
+async def delete_note(note_id: str):
     try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM notes WHERE id = ?", (note_id,))
-        if cursor.rowcount == 0:
-            conn.close()
+        result = await notes_collection.delete_one({"_id": ObjectId(note_id)})
+        if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Record not found")
-        conn.commit()
-        conn.close()
+        
         return {"success": True, "message": "Deleted successfully"}
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database delete failed: {str(e)}")
-    
