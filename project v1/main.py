@@ -72,7 +72,7 @@ async def create_note(note: NoteCreate):
                 response = await ai_client.chat.completions.create(
                     model=AI_MODEL, 
                     messages=[
-                        {"role": "system", "content": "You are a data commentary and analysis expert. Split each comment into separate “aspect” sentences; each sentence can be mapped to one or more Factors (multi-label; a single comment can contribute to multiple Factors at the same time).If a passage contains a positive message, add one point; if it contains a negative message, subtract one point; for ambiguous or irrelevant passages, give zero points. just give final marks"},
+                        {"role": "system", "content": "You are a review analysis expert tasked with analyzing the semantics of these customer reviews. For every positive word you encounter, add one point; for every negative word, subtract one point. Output the scores for positive and negative reviews separately, as well as the total score."},
                         {"role": "user", "content": note.content}
                     ],
                     max_tokens=10000000,
