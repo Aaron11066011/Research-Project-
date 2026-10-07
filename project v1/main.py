@@ -1,6 +1,7 @@
 import os
 import json
 from datetime import datetime, timezone
+from typing import Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
@@ -8,184 +9,364 @@ from openai import AsyncOpenAI
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 
-
 # ================= Configuration & Environment =================
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://viewpicture-input-survivors-beneficial.trycloudflare.com/v1")
 AI_API_KEY = os.getenv("AI_API_KEY", "cloudflare-tunnel-api-key")
 AI_MODEL = os.getenv("AI_MODEL", "gemma4:e4b")
 
-# ================= Data Model =================
+# Trust Index Weights Config (Can be moved to DB later)
+TRUST_WEIGHTS = {
+    "F1_functional_value": 0.20,
+    "F2_transaction_safety": 0.20,
+    "F3_integrity": 0.20,
+    "F4_reputation": 0.20,
+    "F5_interaction": 0.20
+}
+
+FACTOR_KEYS = list(TRUST_WEIGHTS.keys())
+
+# ================= Data Models =================
 class NoteCreate(BaseModel):
     content: str
-    action: str = "save"  # Default is "save", alternative is "agent"
+    action: str = "save"
     
     @field_validator('content')
     @classmethod
     def strip_whitespace(cls, v: str) -> str:
-        cleaned = v.strip()
-        if not cleaned:
+        if not v.strip():
             raise ValueError("Content cannot be empty")
-        return cleaned
-    
-# 接收前端人工校验数据的模型
-class FactorScore(BaseModel):
-    name: str
-    score: int
+        return v.strip()
 
 class VerifyUpdate(BaseModel):
-    factors: list[FactorScore]
-    total: int
+    human_data: Dict[str, Any]
 
-# MongoDB 文档响应模型
-class NoteResponse(BaseModel):
-    id: str
-    content: str
-    agent_reply: str | None = None
-    created_at: str
-
-# ================= Database Setup =================
+# ================= DB Setup =================
 client = AsyncIOMotorClient(MONGO_URL)
 db = client.notes_database
 notes_collection = db.get_collection("notes")
 
-# ================= FastAPI App =================
-app = FastAPI(title="Quick Paste & Agent API")
+app = FastAPI(title="Trust Research Annotation API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ================= Prompts =================
+EXTRACTION_PROMPT = """You are an expert annotation engine for customer trust research.
+Your task is to analyse a customer review and extract TRUST-RELEVANT EVIDENCE. You must NOT assume that general positive sentiment is equivalent to customer trust.
+The output will be used in a Human-in-the-Loop research system and must therefore be conservative, traceable, reproducible, and suitable for later statistical validation.
 
-# ================= API Endpoints =================
+## STEP 1 — IDENTIFY THE TRUST TARGET
+Allowed target types: PRODUCT, BRAND, PLATFORM, SERVICE, SELLER, MULTIPLE, UNCLEAR.
+Never merge evidence about different targets without explicitly identifying them.
 
+## STEP 2-6 — ASPECT-BASED TRUST EVIDENCE EXTRACTION
+Evaluate F1. Functional Value, F2. Transaction Safety, F3. Ethical Behaviour, F4. Awareness/Reputation, F5. Interaction Experience.
+- mentioned: true/false. (If false, polarity and strength MUST be null)
+- polarity: 1, 0, -1. 
+- evidence_strength: LOW, MEDIUM, HIGH.
+- evidence: exact shortest span from text.
+
+## STEP 7-9 — CONFIDENCE & TRUST LANGUAGE
+Assign confidence (0.00-1.00). Identify explicit_trust_expression (true/false) and global research_interpretation.
+
+Return ONLY valid JSON exactly matching this structure (no markdown):
+{
+  "target": { "type": "PRODUCT", "name": null },
+  "explicit_trust": { "present": false, "polarity": null, "evidence": [] },
+  "factors": {
+    "F1_functional_value": { "mentioned": false, "polarity": null, "evidence_strength": null, "confidence": null, "evidence": [], "reason": "" },
+    "F2_transaction_safety": { "mentioned": false, "polarity": null, "evidence_strength": null, "confidence": null, "evidence": [], "reason": "" },
+    "F3_integrity": { "mentioned": false, "polarity": null, "evidence_strength": null, "confidence": null, "evidence": [], "reason": "" },
+    "F4_reputation": { "mentioned": false, "polarity": null, "evidence_strength": null, "confidence": null, "evidence": [], "reason": "" },
+    "F5_interaction": { "mentioned": false, "polarity": null, "evidence_strength": null, "confidence": null, "evidence": [], "reason": "" }
+  },
+  "overall_evidence_pattern": "insufficient_evidence",
+  "research_interpretation": "",
+  "requires_human_review": false,
+  "review_flags": []
+}"""
+
+VALIDATION_PROMPT = """You are a research validation assistant.
+You will receive: 1. The original customer review. 2. The original LLM annotation. 3. A human researcher's verified annotation.
+Your task is NOT to decide which annotation is correct. Your task is to compare the two annotations independently for each factor (mentioned status, polarity, evidence strength, evidence span), identify disagreements, and produce structured data.
+
+Disagreement types: MENTION_DISAGREEMENT, POLARITY_DISAGREEMENT, STRENGTH_DISAGREEMENT, EVIDENCE_DISAGREEMENT, NO_DISAGREEMENT.
+For polarity disagreement, calculate absolute difference.
+
+Return ONLY valid JSON exactly matching this structure (no markdown):
+{
+  "annotation_status": "human_verified",
+  "llm_annotation_preserved": true,
+  "factor_comparison": {
+    "F1_functional_value": { "llm_value": {}, "human_value": {}, "agreement": true, "disagreement_types": [], "polarity_difference": 0 },
+    "F2_transaction_safety": { "llm_value": {}, "human_value": {}, "agreement": true, "disagreement_types": [], "polarity_difference": 0 },
+    "F3_integrity": { "llm_value": {}, "human_value": {}, "agreement": true, "disagreement_types": [], "polarity_difference": 0 },
+    "F4_reputation": { "llm_value": {}, "human_value": {}, "agreement": true, "disagreement_types": [], "polarity_difference": 0 },
+    "F5_interaction": { "llm_value": {}, "human_value": {}, "agreement": true, "disagreement_types": [], "polarity_difference": 0 }
+  },
+  "summary": { "factors_agreed": 0, "factors_disagreed": 0, "polarity_agreements": 0, "polarity_disagreements": 0, "mention_disagreements": 0, "strength_disagreements": 0 },
+  "high_priority_disagreement": false,
+  "high_priority_reasons": []
+}"""
+
+async def call_ai_json(system_prompt: str, user_content: str):
+    try:
+        ai_client = AsyncOpenAI(base_url=AI_BASE_URL, api_key=AI_API_KEY)
+        response = await ai_client.chat.completions.create(
+            model=AI_MODEL, 
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}],
+            max_tokens=2500, temperature=0.1
+        )         
+        reply = response.choices[0].message.content.strip()
+        start = reply.find('{')
+        end = reply.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            return json.loads(reply[start : end + 1]), reply
+        return None, reply
+    except Exception as e:
+        print(f"AI Call Error: {e}")
+        return None, str(e)
+
+def strength_to_num(val):
+    if val == "HIGH": return 3
+    if val == "MEDIUM": return 2
+    if val == "LOW": return 1
+    return None
+
+# ================= Endpoints =================
 @app.post("/api/notes")
 async def create_note(note: NoteCreate):
-    try:
-        agent_reply = None
-        parsed_data = None
-        # [新增] 默认状态为只有文本，如果是 AI 跑的则标记为待校验
-        verification_status = "text_only" 
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    agent_reply, llm_data = None, None
+    status = "raw" 
 
-        if note.action == "agent":
-            try:
-                ai_client = AsyncOpenAI(base_url=AI_BASE_URL, api_key=AI_API_KEY)
-                response = await ai_client.chat.completions.create(
-                    model=AI_MODEL, 
-                    messages=[
-                        {
-                            "role": "system", 
-                            "content": """You are an expert data evaluator. 
-                            Evaluate the user's text against the following 5 predefined factors:
-                            1. Functional Value and Service Benefit The extent to which the platform or product helps users achieve what they want efficiently and provides clear practical benefits.
-                            2. Transaction Safety and Risk Protection The extent to which the platform protects users from fraud, financial loss, or unfair transactions.
-                            3. Ethical Behaviour and Integrity of the Platform The belief that the platform, sellers, or providers act honestly, keep promises, and treat users fairly.
-                            4. Awareness / Reputational Signal Trust arising from market-mediated signals about the provider that operate through AWARENESS—exposure, familiarity, share of voice, and association with premium brands, advertising and sponsorship—or through REPUTATION—evaluative feedback from others, spanning anonymous on-platform signals (ratings, reviews, reputational indicators) and personal networks (word of mouth).
-                            5. Positive Interaction Experience Trust that develops from a user's direct experience interacting with the platform (smooth navigation, successful transactions, satisfying service outcomes), including ease of use / usability (simple navigation, search, and task completion).
+    if note.action == "agent":
+        llm_data, agent_reply = await call_ai_json(EXTRACTION_PROMPT, note.content)
+        status = "llm_annotated" if llm_data else "raw"
 
-                            Scoring Rules:
-                            +1 if positive/met, -1 if negative/unmet, 0 if neutral/not mentioned.
-                            Calculate the "total". Return ONLY valid JSON format below without markdown wrappers:
-                            {
-                              "factors": [
-                                {"name": "Functional Value and Service Benefit", "score": 1},
-                                {"name": "Transaction Safety and Risk Protection", "score": 1},
-                                {"name": "Ethical Behaviour and Integrity of the Platform", "score": 1},
-                                {"name": "Awareness / Reputational Signal", "score": 1},
-                                {"name": "Positive Interaction Experience", "score": 1}
-                              ],
-                              "total": 0
-                            }"""
-                        },
-                        {"role": "user", "content": note.content}
-                    ],
-                    max_tokens=2000,
-                    temperature=0.1
-                )         
-                agent_reply = response.choices[0].message.content.strip()
-                verification_status = "llm_only" # [新增] 标记为 AI 预处理，待人工校验
-                try:
-                    # 过滤掉可能的 markdown 代码块标记
-                    clean_json = agent_reply.replace("```json", "").replace("```", "").strip()
-                    parsed_data = json.loads(clean_json)
-                except Exception as e:
-                    print(f"JSON Parse Error: {e}")
-
-            except Exception as e:
-                agent_reply = f"Failed to connect to local AI API: {str(e)}"
-        # =========================================================
-        
-        # =========================================================
-
-       # 插入 MongoDB
-        note_dict = {
-            "content": note.content,
-            "agent_reply": agent_reply,
-            "parsed_data": parsed_data,
-            "verification_status": verification_status,
+    # New DB Schema
+    document = {
+        "review_id": f"R-{ObjectId()}",
+        "raw_data": {
+            "review_text": note.content,
             "created_at": now
+        },
+        "llm_annotation": llm_data,
+        "llm_raw_reply": agent_reply,
+        "human_annotations": [],
+        "final_annotation": None,
+        "comparison": None,
+        "workflow": {
+            "status": status,
+            "last_updated_at": now
         }
-        result = await notes_collection.insert_one(note_dict)
-        
-        return {
-            "success": True, 
-            "id": str(result.inserted_id), 
-            "agent_reply": agent_reply,
-            "parsed_data": parsed_data,
-            "verification_status": verification_status,
-            "message": "Agent channel triggered" if note.action == "agent" else "Text saved successfully"
-        }     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Write failed: {str(e)}")
-
-@app.get("/api/notes", response_model=dict)
-async def get_notes():
-    try:
-        # 获取最新 20 条记录
-        cursor = notes_collection.find().sort("_id", -1).limit(20)
-        notes = []
-        async for document in cursor:
-            notes.append({
-                "id": str(document["_id"]),
-                "content": document["content"],
-                "agent_reply": document.get("agent_reply"),
-                "parsed_data": document.get("parsed_data"),
-                "verification_status": document.get("verification_status"),
-                "created_at": document.get("created_at")
-            })
-        return {"success": True, "data": notes}
+    }
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database read failed: {str(e)}")
+    result = await notes_collection.insert_one(document)
+    return {"success": True, "id": str(result.inserted_id)}
+
+@app.get("/api/notes")
+async def get_notes():
+    # Legacy fallback mapping included in output formatting
+    cursor = notes_collection.find().sort("_id", -1).limit(50)
+    notes = []
+    async for doc in cursor:
+        # Migration mapping for UI
+        status = doc.get("workflow", {}).get("status", doc.get("verification_status", "raw"))
+        notes.append({
+            "id": str(doc["_id"]),
+            "content": doc.get("raw_data", {}).get("review_text", doc.get("content", "")),
+            "llm_parsed_data": doc.get("llm_annotation", doc.get("llm_parsed_data")),
+            "human_parsed_data": doc.get("final_annotation", doc.get("human_parsed_data")),
+            "validation_data": doc.get("comparison", doc.get("validation_data")),
+            "verification_status": status,
+            "created_at": doc.get("raw_data", {}).get("created_at", doc.get("created_at", ""))
+        })
+    return {"success": True, "data": notes}
 
 @app.put("/api/notes/{note_id}/verify")
 async def verify_note(note_id: str, update_data: VerifyUpdate):
-    try:
-        result = await notes_collection.update_one(
-            {"_id": ObjectId(note_id)},
-            {"$set": {
-                "parsed_data": update_data.model_dump(),
-                "verification_status": "human_verified" # 将状态更新为人工确认完毕
-            }}
-        )
-        if result.matched_count == 0:
-            raise HTTPException(status_code=404, detail="Record not found")
-        
-        return {"success": True, "message": "Verified and updated"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Verify failed: {str(e)}")
+    doc = await notes_collection.find_one({"_id": ObjectId(note_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    human_data = update_data.human_data
+    llm_data = doc.get("llm_annotation", doc.get("llm_parsed_data", {}))
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Automatically trigger the validation Agent to perform the comparison.
+    validation_input = json.dumps({
+        "review_text": doc.get("raw_data", {}).get("review_text", doc.get("content", "")),
+        "llm_annotation": llm_data,
+        "human_annotation": human_data
+    })
+    
+    validation_data, _ = await call_ai_json(VALIDATION_PROMPT, validation_input)
+
+    # Completely save the Human historical records without overwriting the original data of LLM.
+    human_record = {
+        "annotator_id": "human_researcher_1",
+        "verified_at": now,
+        "factors": human_data.get("factors", {})
+    }
+
+    await notes_collection.update_one(
+        {"_id": ObjectId(note_id)},
+        {
+            "$push": {"human_annotations": human_record},
+            "$set": {
+                "final_annotation": human_data,
+                "comparison": validation_data,
+                "workflow.status": "human_verified",
+                "workflow.last_updated_at": now,
+                # Legacy updates
+                "human_parsed_data": human_data,
+                "validation_data": validation_data,
+                "verification_status": "human_verified"
+            }
+        }
+    )
+    return {"success": True}
 
 @app.delete("/api/notes/{note_id}")
 async def delete_note(note_id: str):
-    try:
-        result = await notes_collection.delete_one({"_id": ObjectId(note_id)})
-        if result.deleted_count == 0:
-            raise HTTPException(status_code=404, detail="Record not found")
+    await notes_collection.delete_one({"_id": ObjectId(note_id)})
+    return {"success": True}
+
+
+# ================= DETERMINISTIC ANALYTICS (Python Math Only) =================
+@app.get("/api/analytics/dashboard")
+async def get_dashboard_analytics():
+    cursor = notes_collection.find()
+    
+    total = 0
+    llm_count = 0
+    human_count = 0
+    
+    # Factor aggregation tracking
+    factors = {k: {"mentions": 0, "pos": 0, "neu": 0, "neg": 0, "strength_sum": 0, "strength_count": 0, "conf_sum": 0, "conf_count": 0, "polarity_sum": 0} for k in FACTOR_KEYS}
+    
+    # Disagreement tracking
+    disagreements = {k: {"mention_diff": 0, "polarity_diff": 0, "strength_diff": 0, "total_comparisons": 0} for k in FACTOR_KEYS}
+
+    async for doc in cursor:
+        total += 1
+        status = doc.get("workflow", {}).get("status", doc.get("verification_status", ""))
         
-        return {"success": True, "message": "Deleted successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database delete failed: {str(e)}")
+        if status in ["llm_annotated", "llm_only", "human_verified", "adjudicated"]:
+            llm_count += 1
+        if status in ["human_verified", "adjudicated"]:
+            human_count += 1
+            
+        # Determine source of truth for math (Human verified preferred)
+        active_data = doc.get("final_annotation") or doc.get("human_parsed_data") or doc.get("llm_annotation") or doc.get("llm_parsed_data")
+        
+        if active_data and "factors" in active_data:
+            factors_data = active_data["factors"]
+            if isinstance(factors_data, dict):
+                for fk in FACTOR_KEYS:
+                    f_data = factors_data.get(fk, {})
+                    if f_data.get("mentioned") is True:
+                        factors[fk]["mentions"] += 1
+                        pol = f_data.get("polarity")
+                        
+                        if pol == 1: factors[fk]["pos"] += 1
+                        elif pol == 0: factors[fk]["neu"] += 1
+                        elif pol == -1: factors[fk]["neg"] += 1
+                        
+                        if pol is not None:
+                            factors[fk]["polarity_sum"] += pol
+                            
+                        strength_val = strength_to_num(f_data.get("evidence_strength"))
+                        if strength_val:
+                            factors[fk]["strength_sum"] += strength_val
+                            factors[fk]["strength_count"] += 1
+                            
+                        conf = f_data.get("confidence")
+                        if conf is not None:
+                            factors[fk]["conf_sum"] += conf
+                            factors[fk]["conf_count"] += 1
+
+        comp = doc.get("comparison") or doc.get("validation_data")
+        if comp and "factor_comparison" in comp:
+            for fk in FACTOR_KEYS:
+                f_comp = comp["factor_comparison"].get(fk, {})
+                disagreements[fk]["total_comparisons"] += 1
+                dtypes = f_comp.get("disagreement_types", [])
+                if "MENTION_DISAGREEMENT" in dtypes: disagreements[fk]["mention_diff"] += 1
+                if "POLARITY_DISAGREEMENT" in dtypes: disagreements[fk]["polarity_diff"] += 1
+                if "STRENGTH_DISAGREEMENT" in dtypes: disagreements[fk]["strength_diff"] += 1
+
+    response = {
+        "dataset_summary": {
+            "total_reviews": total,
+            "llm_annotated_reviews": llm_count,
+            "human_verified_reviews": human_count,
+            "verification_rate": round(human_count / total, 4) if total > 0 else 0
+        },
+        "factor_statistics": {},
+        "factor_scores": {},
+        "disagreement": {}
+    }
+    
+    missing_factors = []
+    raw_index_score = 0
+    available_weight_sum = 0
+    
+    for fk in FACTOR_KEYS:
+        f = factors[fk]
+        mentions = f["mentions"]
+        rate = mentions / total if total > 0 else 0
+        
+        response["factor_statistics"][fk] = {
+            "mentioned_count": mentions,
+            "mention_rate": round(rate, 4),
+            "positive_count": f["pos"],
+            "neutral_mixed_count": f["neu"],
+            "negative_count": f["neg"],
+            "positive_rate": round(f["pos"] / mentions, 4) if mentions > 0 else 0,
+            "neutral_mixed_rate": round(f["neu"] / mentions, 4) if mentions > 0 else 0,
+            "negative_rate": round(f["neg"] / mentions, 4) if mentions > 0 else 0,
+            "mean_evidence_strength": round(f["strength_sum"] / f["strength_count"], 2) if f["strength_count"] > 0 else None,
+            "mean_confidence": round(f["conf_sum"] / f["conf_count"], 2) if f["conf_count"] > 0 else None
+        }
+        
+        score = round(f["polarity_sum"] / mentions, 4) if mentions > 0 else None
+        response["factor_scores"][fk] = {
+            "score": score,
+            "mention_count": mentions,
+            "mention_rate": round(rate, 4)
+        }
+        
+        # Precisely handle the missing items and record only once.
+        if score is None:
+            missing_factors.append(fk)
+        else:
+            raw_index_score += score * TRUST_WEIGHTS[fk]
+            available_weight_sum += TRUST_WEIGHTS[fk]
+            
+        d = disagreements[fk]
+        comps = d["total_comparisons"]
+        response["disagreement"][fk] = {
+            "mention": {"numerator": d["mention_diff"], "denominator": comps, "rate": round(d["mention_diff"]/comps, 4) if comps>0 else None},
+            "polarity": {"numerator": d["polarity_diff"], "denominator": comps, "rate": round(d["polarity_diff"]/comps, 4) if comps>0 else None},
+            "strength": {"numerator": d["strength_diff"], "denominator": comps, "rate": round(d["strength_diff"]/comps, 4) if comps>0 else None}
+        }
+
+    # normalization
+    if available_weight_sum > 0:
+        trust_status = "CALCULATED_WITH_RENORMALIZATION" if missing_factors else "CALCULATED"
+        index_score = raw_index_score / available_weight_sum
+    else:
+        trust_status = "NOT_CALCULATED_DUE_TO_NO_DATA"
+        index_score = None
+        
+    response["trust_index"] = {
+        "status": trust_status,
+        "score": round(index_score, 4) if index_score is not None else None,
+        "weights": TRUST_WEIGHTS,
+        "coverage": round((len(FACTOR_KEYS) - len(missing_factors)) / len(FACTOR_KEYS), 4),
+        "missing_factors": missing_factors,
+        "validation_status": "PROPOSED_UNVALIDATED (RENORMALIZED)" if missing_factors else "PROPOSED_UNVALIDATED"
+    }
+
+    return response
