@@ -2,15 +2,19 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import notes, analytics
 
-app = FastAPI(title="Trust Research Annotation API")
+app = FastAPI()
 
+origins = [
+    "http://localhost:3000",
+    "https://research-project-delta-gold.vercel.app" 
+]
 
 app.add_middleware(
-    CORSMiddleware, 
-    allow_origins=["*"], 
-    allow_credentials=True, 
-    allow_methods=["*"], 
-    allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=origins,  
+    allow_credentials=True,
+    allow_methods=["*"],    
+    allow_headers=["*"],    
 )
 
 
